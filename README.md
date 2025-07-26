@@ -122,10 +122,15 @@ Excludes common system and temporary files:
 Syncs all files including system and temporary files.
 
 ### Custom Filters
-Modify `dropbox-filters.txt` or specify your own with `-f`:
-```bash
-./rclone-dropbox-sync.sh -l ~/Documents -f my-custom-filters.txt
-```
+The script automatically creates `.rclone-filters.txt` in each sync directory on first run. You can:
+
+1. **Use the auto-created file**: Customize `.rclone-filters.txt` in your sync directory
+2. **Specify a custom file**: Use `-f` option to specify a different filters file:
+   ```bash
+   ./rdsync -l ~/Documents -f my-custom-filters.txt
+   ```
+
+**Note**: If you modify filter files after bisync is established, you must run `--resync` to update rclone's state.
 
 ## Logging
 
@@ -159,6 +164,12 @@ Each log contains:
 
 3. **"Local directory does not exist"**:
    Ensure the local path exists before syncing.
+
+4. **"filters file has changed (must run --resync)"**:
+   When filter files are modified after bisync is established, rclone requires resync:
+   ```bash
+   ./rdsync --resync
+   ```
 
 ### Recovery Options
 

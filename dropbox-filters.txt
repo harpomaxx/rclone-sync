@@ -16,7 +16,6 @@
 - .~lock.*
 
 # System files that shouldn't sync
-- .git/
 - .svn/
 - .hg/
 - .bzr/

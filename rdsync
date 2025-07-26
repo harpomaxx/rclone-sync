@@ -146,6 +146,72 @@ reset_state() {
     fi
 }
 
+# Function to generate default filter template
+get_default_filters_template() {
+    cat << 'EOF'
+# Dropbox filter file - files that should not be synced
+# Based on Dropbox restrictions and common temporary files
+# This file is used when --exclude-system-files is enabled (default)
+
+# Dropbox disallowed files
+- .dropbox
+- .dropbox.attr
+- .dropbox.cache
+- .DS_Store
+- desktop.ini
+- Thumbs.db
+- .tmp
+- ~*
+- *.tmp
+- *.temp
+- .~lock.*
+
+# System files that shouldn't sync
+- .svn/
+- .hg/
+- .bzr/
+- CVS/
+
+# IDE and editor temporary files
+- .vscode/
+- .idea/
+- *.swp
+- *.swo
+- *~
+- .#*
+- #*#
+
+# OS specific files
+- __pycache__/
+- *.pyc
+- *.pyo
+- .cache/
+- node_modules/
+
+# Log files
+- *.log
+- logs/
+
+# Backup files
+- *.bak
+- *.backup
+- *.old
+EOF
+}
+
+# Function to auto-create filters file if it doesn't exist
+auto_create_filters_file() {
+    local local_dir="$1"
+    local filters_file="$local_dir/.rclone-filters.txt"
+    
+    # Only create if EXCLUDE_SYSTEM_FILES is enabled and file doesn't exist
+    if [[ "$EXCLUDE_SYSTEM_FILES" = true && ! -f "$filters_file" ]]; then
+        log "INFO" "Creating default filters file: $filters_file"
+        get_default_filters_template > "$filters_file"
+        log "INFO" "Filter file created. You can customize it for this directory's needs."
+    fi
+}
+
 # Function to determine remote path and auto-configure first sync
 determine_remote_path() {
     local specified_remote_name="$1"
@@ -170,6 +236,8 @@ determine_remote_path() {
                 RESYNC=true
                 log "INFO" "First run detected - automatically enabling --resync"
             fi
+            # Auto-create default filters file if needed
+            auto_create_filters_file "$LOCAL_DIR"
         fi
         
         if [[ "$force_remote_path" = true ]]; then
