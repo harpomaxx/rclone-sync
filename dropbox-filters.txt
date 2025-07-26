@@ -1,0 +1,48 @@
+# Dropbox filter file - files that should not be synced
+# Based on Dropbox restrictions and common temporary files
+# This file is used when --exclude-system-files is enabled (default)
+
+# Dropbox disallowed files
+- .dropbox
+- .dropbox.attr
+- .dropbox.cache
+- .DS_Store
+- desktop.ini
+- Thumbs.db
+- .tmp
+- ~*
+- *.tmp
+- *.temp
+- .~lock.*
+
+# System files that shouldn't sync
+- .git/
+- .svn/
+- .hg/
+- .bzr/
+- CVS/
+
+# IDE and editor temporary files
+- .vscode/
+- .idea/
+- *.swp
+- *.swo
+- *~
+- .#*
+- #*#
+
+# OS specific files
+- __pycache__/
+- *.pyc
+- *.pyo
+- .cache/
+- node_modules/
+
+# Log files
+- *.log
+- logs/
+
+# Backup files
+- *.bak
+- *.backup
+- *.old

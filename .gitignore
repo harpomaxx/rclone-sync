@@ -1,0 +1,23 @@
+# Logs directory and log files
+logs/
+*.log
+
+# Sync state files (local configuration, shouldn't be committed)
+.rclone-sync-state
+.sync-state
+
+# Filter hash files (auto-generated)
+*.md5
+
+# Local sync filter files (each user should have their own)
+.rclone-filters.txt
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini

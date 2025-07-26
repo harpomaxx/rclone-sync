@@ -1,0 +1,599 @@
+#!/bin/bash
+
+# Rclone Dropbox Bidirectional Sync Script
+# Uses rclone bisync for true bidirectional synchronization
+# Remembers remote path after first sync
+
+set -euo pipefail
+
+# Default configuration
+DEFAULT_LOCAL_DIR=""
+DEFAULT_REMOTE_NAME="dropbox"
+DEFAULT_REMOTE_DIR=""
+DEFAULT_LOG_DIR="$HOME/.rclone-sync/logs"
+DEFAULT_FILTERS_FILE=".rclone-filters.txt"
+DRY_RUN=false
+EXCLUDE_SYSTEM_FILES=true
+RESYNC=false
+CHECK_ACCESS=false
+RESILIENT=false
+VERBOSE=false
+FORCE=false
+FORCE_REMOTE_PATH=false
+LIST_REMOTE=false
+LIST_REMOTE_DIR=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# State file will be set based on local directory
+STATE_FILE=""
+
+# Function to display usage
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Bidirectional sync between local directory and Dropbox using rclone bisync.
+After first sync, the remote path is remembered and reused automatically.
+
+OPTIONS:
+  -l, --local-dir DIR          Local directory to sync (optional, defaults to current directory)
+  -r, --remote-name NAME       Rclone remote name (default: dropbox)
+  -d, --remote-dir DIR         Remote directory path (required for first sync)
+  -f, --filters-file FILE      Filters file path (default: .rclone-filters.txt in local dir)
+  --log-dir DIR               Log directory (default: ~/.rclone-sync/logs)
+  
+  --dry-run                   Show what would be done without making changes
+  --exclude-system-files      Use filters file to exclude system/temp files (default: true)
+  --no-exclude-system-files   Sync everything including system/temp files
+  --resync                    Perform initial resync (auto-enabled for first run)
+  --check-access             Enable access checks (disabled by default)
+  --resilient                Enable resilient mode for handling minor errors
+  --verbose                  Enable verbose output
+  --force                    Force sync even when many deletes detected
+  --force-remote-path        Override remembered remote path with specified one
+  --reset-state              Reset remembered remote path and start fresh
+  --list-remote [DIR]        List files in remote directory (optional DIR, defaults to root)
+  
+  -h, --help                 Show this help message
+
+WORKFLOW:
+  This script works like git - run from within your project directory.
+  The first sync establishes the connection, subsequent syncs remember it.
+
+STATE MANAGEMENT:
+  State is stored as .rclone-sync-state in each local directory.
+  Each directory remembers its own remote path independently.
+  Use --force-remote-path to change to a different remote path.
+  Use --reset-state to forget the current remote path.
+
+EXAMPLES:
+  # First sync - establish connection (from anywhere)
+  rdsync -l /home/user/Documents -d MyFolder
+  
+  # OR run from within the directory
+  cd /home/user/Documents
+  rdsync -d MyFolder
+  
+  # Subsequent syncs - just run from within the directory
+  cd /home/user/Documents
+  rdsync    # No parameters needed!
+  
+  # Different directory, different remote path
+  cd /home/user/Photos
+  rdsync -d PhotoBackup    # First sync
+  rdsync                   # Subsequent syncs
+  
+  # Change remote path for current directory
+  rdsync -d DifferentFolder --force-remote-path
+  
+  # List files in remote directory
+  cd /home/user/Documents
+  rdsync --list-remote                     # Lists configured remote for this directory
+  rdsync --list-remote MyFolder/SubFolder # Lists specific remote path
+
+REQUIREMENTS:
+  - rclone must be installed and configured with Dropbox remote
+  - First run automatically enables --resync
+  - Access checks are disabled by default (can be enabled with --check-access)
+
+EOF
+}
+
+# Function to log messages with timestamp
+log() {
+    local level="$1"
+    shift
+    # Ensure log directory exists before logging
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a "$LOG_FILE"
+}
+
+# Function to save state
+save_state() {
+    local remote_name="$1"
+    local remote_dir="$2"
+    local remote_path="${remote_name}:${remote_dir}"
+    
+    cat > "$STATE_FILE" << EOF
+# Rclone sync state file - DO NOT EDIT MANUALLY
+REMOTE_NAME="$remote_name"
+REMOTE_DIR="$remote_dir"
+REMOTE_PATH="$remote_path"
+LAST_SYNC="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    log "INFO" "Saved remote path to state: $remote_path"
+}
+
+# Function to load state
+load_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        source "$STATE_FILE"
+        log "INFO" "Loaded remote path from state: $REMOTE_PATH (last sync: $LAST_SYNC)"
+        return 0
+    else
+        log "INFO" "No state file found - this appears to be first run"
+        return 1
+    fi
+}
+
+# Function to reset state
+reset_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        rm "$STATE_FILE"
+        log "INFO" "State file reset"
+    else
+        log "INFO" "No state file to reset"
+    fi
+}
+
+# Function to determine remote path and auto-configure first sync
+determine_remote_path() {
+    local specified_remote_name="$1"
+    local specified_remote_dir="$2"
+    local force_remote_path="$3"
+    
+    # Check if this is first run (no state file exists)
+    local is_first_run=false
+    if [[ ! -f "$STATE_FILE" ]]; then
+        is_first_run=true
+    fi
+    
+    # If forcing remote path or no state exists, use specified values
+    if [[ "$force_remote_path" = true ]] || ! load_state; then
+        FINAL_REMOTE_NAME="$specified_remote_name"
+        FINAL_REMOTE_DIR="$specified_remote_dir"
+        FINAL_REMOTE_PATH="${FINAL_REMOTE_NAME}:${FINAL_REMOTE_DIR}"
+        
+        # Auto-enable resync for first run
+        if [[ "$is_first_run" = true ]]; then
+            if [[ "$RESYNC" = false ]]; then
+                RESYNC=true
+                log "INFO" "First run detected - automatically enabling --resync"
+            fi
+        fi
+        
+        if [[ "$force_remote_path" = true ]]; then
+            log "INFO" "Using forced remote path: $FINAL_REMOTE_PATH"
+        else
+            log "INFO" "Using specified remote path: $FINAL_REMOTE_PATH"
+        fi
+    else
+        # Use state values
+        FINAL_REMOTE_NAME="$REMOTE_NAME"
+        FINAL_REMOTE_DIR="$REMOTE_DIR"
+        FINAL_REMOTE_PATH="$REMOTE_PATH"
+        log "INFO" "Using remembered remote path: $FINAL_REMOTE_PATH"
+    fi
+}
+
+# Function to check if rclone is installed
+check_rclone() {
+    if ! command -v rclone &> /dev/null; then
+        log "ERROR" "rclone is not installed or not in PATH"
+        exit 1
+    fi
+}
+
+# Function to check if remote exists
+check_remote() {
+    local remote_name="$1"
+    if ! rclone listremotes | grep -q "^${remote_name}:$"; then
+        log "ERROR" "Remote '$remote_name' not found in rclone configuration"
+        log "INFO" "Available remotes:"
+        rclone listremotes | sed 's/^/  /'
+        exit 1
+    fi
+}
+
+# Function to list remote directory contents
+list_remote_directory() {
+    local remote_name="$1"
+    local remote_dir="$2"
+    local remote_path="${remote_name}:${remote_dir}"
+    
+    log "INFO" "Listing contents of remote directory: $remote_path"
+    
+    # Check if remote exists first
+    check_remote "$remote_name"
+    
+    # List directory contents
+    if rclone lsl "$remote_path" 2>/dev/null; then
+        log "INFO" "Successfully listed remote directory contents"
+    else
+        log "ERROR" "Failed to list remote directory: $remote_path"
+        exit 1
+    fi
+}
+
+# Function to validate directories
+validate_paths() {
+    local local_dir="$1"
+    local remote_path="$2"
+    
+    # Check if local directory exists, create if not
+    if [[ ! -d "$local_dir" ]]; then
+        log "INFO" "Local directory does not exist, creating: $local_dir"
+        mkdir -p "$local_dir"
+    fi
+    
+    # Test remote connectivity
+    log "INFO" "Testing remote connectivity..."
+    if ! rclone lsd "$remote_path" >/dev/null 2>&1; then
+        # Remote directory doesn't exist or can't be accessed
+        if [[ "$RESYNC" = true ]]; then
+            # This is a first sync, try to create the remote directory
+            log "INFO" "Remote directory does not exist, creating: $remote_path"
+            if rclone mkdir "$remote_path" 2>/dev/null; then
+                log "INFO" "Successfully created remote directory: $remote_path"
+                # Verify creation by testing access again
+                if ! rclone lsd "$remote_path" >/dev/null 2>&1; then
+                    log "ERROR" "Created remote directory but still cannot access: $remote_path"
+                    exit 1
+                fi
+            else
+                log "ERROR" "Failed to create remote directory: $remote_path"
+                log "ERROR" "Please check your remote configuration and permissions"
+                exit 1
+            fi
+        else
+            # This is a subsequent sync, remote directory should exist
+            log "ERROR" "Cannot access remote path: $remote_path"
+            log "ERROR" "This appears to be a subsequent sync, but the remote directory is missing"
+            log "ERROR" "Run with -d flag to specify a different remote directory, or check your remote"
+            exit 1
+        fi
+    else
+        log "INFO" "Remote directory accessible: $remote_path"
+    fi
+}
+
+# Function to create necessary directories
+setup_directories() {
+    local log_dir="$1"
+    
+    mkdir -p "$log_dir"
+    
+    # Create filters file if it doesn't exist and we need it
+    if [[ "$EXCLUDE_SYSTEM_FILES" = true && ! -f "$FILTERS_FILE" ]]; then
+        log "INFO" "Creating default filters file: $FILTERS_FILE"
+        create_default_filters "$FILTERS_FILE"
+    fi
+}
+
+# Function to create default filters file
+create_default_filters() {
+    local filters_file="$1"
+    cat > "$filters_file" << 'EOF'
+# Dropbox filter file - files that should not be synced
+# Based on Dropbox restrictions and common temporary files
+
+# Dropbox disallowed files
+- .dropbox
+- .dropbox.attr
+- .dropbox.cache
+- .DS_Store
+- desktop.ini
+- Thumbs.db
+- .tmp
+- ~*
+- *.tmp
+- *.temp
+- .~lock.*
+
+# System files that shouldn't sync
+- .git/
+- .svn/
+- .hg/
+- .bzr/
+- CVS/
+
+# IDE and editor temporary files
+- .vscode/
+- .idea/
+- *.swp
+- *.swo
+- *~
+- .#*
+- #*#
+
+# OS specific files
+- __pycache__/
+- *.pyc
+- *.pyo
+- .cache/
+- node_modules/
+
+# Sync state and filter files (don't sync themselves)
+- .rclone-sync-state
+- .rclone-filters.txt
+- .rclone-filters.txt.md5
+
+# Log files
+- *.log
+- logs/
+
+# Backup files
+- *.bak
+- *.backup
+- *.old
+EOF
+}
+
+# Function to build rclone command
+build_rclone_command() {
+    local local_dir="$1"
+    local remote_path="$2"
+    local cmd_args=()
+    
+    cmd_args+=("bisync")
+    cmd_args+=("$local_dir")
+    cmd_args+=("$remote_path")
+    
+    # Add conditional flags
+    if [[ "$DRY_RUN" = true ]]; then
+        cmd_args+=("--dry-run")
+    fi
+    
+    if [[ "$RESYNC" = true ]]; then
+        cmd_args+=("--resync")
+    fi
+    
+    if [[ "$CHECK_ACCESS" = true ]]; then
+        cmd_args+=("--check-access")
+    fi
+    
+    if [[ "$RESILIENT" = true ]]; then
+        cmd_args+=("--resilient")
+    fi
+    
+    if [[ "$VERBOSE" = true ]]; then
+        cmd_args+=("--verbose")
+    fi
+    
+    if [[ "$FORCE" = true ]]; then
+        cmd_args+=("--force")
+    fi
+    
+    if [[ "$EXCLUDE_SYSTEM_FILES" = true && -f "$FILTERS_FILE" ]]; then
+        cmd_args+=("--filters-file" "$FILTERS_FILE")
+    fi
+    
+    # Always add progress and log options
+    cmd_args+=("--progress")
+    cmd_args+=("--log-file" "$LOG_FILE")
+    cmd_args+=("--log-level" "INFO")
+    
+    echo "${cmd_args[@]}"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -l|--local-dir)
+            DEFAULT_LOCAL_DIR="$2"
+            shift 2
+            ;;
+        -r|--remote-name)
+            DEFAULT_REMOTE_NAME="$2"
+            shift 2
+            ;;
+        -d|--remote-dir)
+            DEFAULT_REMOTE_DIR="$2"
+            shift 2
+            ;;
+        -f|--filters-file)
+            DEFAULT_FILTERS_FILE="$2"
+            shift 2
+            ;;
+        --log-dir)
+            DEFAULT_LOG_DIR="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --exclude-system-files)
+            EXCLUDE_SYSTEM_FILES=true
+            shift
+            ;;
+        --no-exclude-system-files)
+            EXCLUDE_SYSTEM_FILES=false
+            shift
+            ;;
+        --resync)
+            RESYNC=true
+            shift
+            ;;
+        --check-access)
+            CHECK_ACCESS=true
+            shift
+            ;;
+        --resilient)
+            RESILIENT=true
+            shift
+            ;;
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
+        --force-remote-path)
+            FORCE_REMOTE_PATH=true
+            shift
+            ;;
+        --reset-state)
+            reset_state
+            exit 0
+            ;;
+        --list-remote)
+            LIST_REMOTE=true
+            if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                LIST_REMOTE_DIR="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Handle list-remote command early
+if [[ "$LIST_REMOTE" = true ]]; then
+    # Set up basic logging for list command
+    LOG_DIR="$DEFAULT_LOG_DIR"
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/rclone-$(date '+%Y-%m-%d').log"
+    
+    # Add session separator
+    echo "" >> "$LOG_FILE"
+    echo "=== LIST REMOTE SESSION STARTED: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+    
+    # Determine which remote path to list
+    list_remote_name="$DEFAULT_REMOTE_NAME"
+    list_remote_dir="$LIST_REMOTE_DIR"
+    
+    # Check if we're in a directory with sync state and no explicit path given
+    if [[ -z "$LIST_REMOTE_DIR" ]]; then
+        current_dir="$(pwd)"
+        state_file="$current_dir/.rclone-sync-state"
+        
+        if [[ -f "$state_file" ]]; then
+            # Load state to get configured remote path
+            source "$state_file"
+            list_remote_name="$REMOTE_NAME"
+            list_remote_dir="$REMOTE_DIR"
+            echo "Using configured remote path from current directory: $REMOTE_PATH"
+        else
+            echo "No sync configuration found in current directory, listing root of $list_remote_name"
+        fi
+    fi
+    
+    # Check rclone and list remote directory
+    check_rclone
+    list_remote_directory "$list_remote_name" "$list_remote_dir"
+    exit 0
+fi
+
+# Handle local directory parameter
+if [[ -z "$DEFAULT_LOCAL_DIR" ]]; then
+    # No -l provided, use current directory
+    DEFAULT_LOCAL_DIR="$(pwd)"
+    echo "No local directory specified, using current directory: $DEFAULT_LOCAL_DIR"
+fi
+
+# Set up paths based on local directory
+LOCAL_DIR="$DEFAULT_LOCAL_DIR"
+LOG_DIR="$DEFAULT_LOG_DIR"
+FILTERS_FILE="$DEFAULT_FILTERS_FILE"
+
+# Convert local directory to absolute path
+if [[ "$LOCAL_DIR" != /* ]]; then
+    LOCAL_DIR="$(pwd)/$LOCAL_DIR"
+fi
+
+# Set state file in local directory
+STATE_FILE="$LOCAL_DIR/.rclone-sync-state"
+
+# Validate state file exists for subsequent syncs
+if [[ ! -f "$STATE_FILE" && -z "$DEFAULT_REMOTE_DIR" ]]; then
+    echo "Error: No sync configuration found in current directory." >&2
+    echo "This appears to be the first sync for this directory." >&2
+    echo "" >&2
+    echo "For first sync, specify remote directory:" >&2
+    echo "  rdsync -l \"$LOCAL_DIR\" -d remote/folder" >&2
+    echo "" >&2
+    echo "Or run from a directory that has been previously synced." >&2
+    exit 1
+fi
+
+# Set filters file in local directory if not absolute path
+if [[ "$FILTERS_FILE" != /* ]]; then
+    FILTERS_FILE="$LOCAL_DIR/$FILTERS_FILE"
+fi
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+# Set up daily log file
+LOG_FILE="$LOG_DIR/rclone-$(date '+%Y-%m-%d').log"
+
+# Determine which remote path to use
+determine_remote_path "$DEFAULT_REMOTE_NAME" "$DEFAULT_REMOTE_DIR" "$FORCE_REMOTE_PATH"
+
+# Main execution
+main() {
+    # Add session separator to log
+    echo "" >> "$LOG_FILE"
+    echo "=== SYNC SESSION STARTED: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+    
+    log "INFO" "Starting rclone bisync"
+    log "INFO" "Local directory: $LOCAL_DIR"
+    log "INFO" "Remote path: $FINAL_REMOTE_PATH"
+    log "INFO" "Exclude system files: $EXCLUDE_SYSTEM_FILES"
+    log "INFO" "Dry run: $DRY_RUN"
+    
+    # Setup
+    check_rclone
+    check_remote "$FINAL_REMOTE_NAME"
+    setup_directories "$LOG_DIR"
+    validate_paths "$LOCAL_DIR" "$FINAL_REMOTE_PATH"
+    
+    # Build and execute rclone command
+    local cmd_args
+    read -ra cmd_args <<< "$(build_rclone_command "$LOCAL_DIR" "$FINAL_REMOTE_PATH")"
+    
+    log "INFO" "Executing: rclone ${cmd_args[*]}"
+    
+    if rclone "${cmd_args[@]}"; then
+        log "INFO" "Sync completed successfully"
+        
+        # Save state after successful sync (only if not dry run)
+        if [[ "$DRY_RUN" = false ]]; then
+            save_state "$FINAL_REMOTE_NAME" "$FINAL_REMOTE_DIR"
+        fi
+        
+        echo "=== SYNC SESSION COMPLETED: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+        exit 0
+    else
+        local exit_code=$?
+        log "ERROR" "Sync failed with exit code: $exit_code"
+        echo "=== SYNC SESSION FAILED: $(date '+%Y-%m-%d %H:%M:%S') (exit code: $exit_code) ===" >> "$LOG_FILE"
+        exit $exit_code
+    fi
+}
+
+# Execute main function
+main "$@"
